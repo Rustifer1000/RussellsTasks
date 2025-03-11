@@ -1,0 +1,123 @@
+$(document).ready(function() {
+    // Timer settings
+    const workDuration = 25 * 60; // 25 minutes in seconds
+    const shortBreak = 5 * 60;    // 5 minutes
+    const longBreak = 15 * 60;    // 15 minutes
+    const cyclesBeforeLongBreak = 4;
+    
+    let timer;
+    let timeLeft = workDuration;
+    let isRunning = false;
+    let isBreak = false;
+    let currentCycle = 0;
+    
+    // Format time as MM:SS
+    function formatTime(seconds) {
+        const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
+        const secs = (seconds % 60).toString().padStart(2, '0');
+        return `${mins}:${secs}`;
+    }
+    
+    // Update the timer display
+    function updateDisplay() {
+        $('#timer').text(formatTime(timeLeft));
+        $('#cycleCount').text(currentCycle);
+        $('#phaseLabel').text(isBreak ? 'Break' : 'Work');
+        
+        // Update progress bar
+        const totalTime = isBreak ? 
+            (currentCycle % cyclesBeforeLongBreak === 0 ? longBreak : shortBreak) : 
+            workDuration;
+        const progress = ((totalTime - timeLeft) / totalTime) * 100;
+        $('#timerProgress').css('width', `${progress}%`);
+    }
+    
+    // Timer tick function
+    function tick() {
+        if (timeLeft > 0) {
+            timeLeft--;
+            updateDisplay();
+        } else {
+            completePhase();
+        }
+    }
+    
+    // Complete current phase and switch to next
+    function completePhase() {
+        // Play notification sound
+        const audio = new Audio('/static/notification.mp3');
+        audio.play();
+        
+        // If work phase completed, increment cycle
+        if (!isBreak) {
+            currentCycle++;
+            
+            // Update server with completed pomodoro
+            $.post(`/api/task/${taskId}/pomodoro_complete`);
+        }
+        
+        // Toggle phase
+        isBreak = !isBreak;
+        
+        // Set time based on phase and cycle
+        if (isBreak) {
+            // Set break duration (long break every 4 cycles)
+            timeLeft = (currentCycle % cyclesBeforeLongBreak === 0) ? 
+                longBreak : shortBreak;
+        } else {
+            // Set work duration
+            timeLeft = workDuration;
+        }
+        
+        // Update display
+        updateDisplay();
+        
+        // Pause timer after phase change
+        pauseTimer();
+    }
+    
+    // Start the timer
+    function startTimer() {
+        if (!isRunning) {
+            isRunning = true;
+            timer = setInterval(tick, 1000);
+            $('#startButton').prop('disabled', true);
+            $('#pauseButton').prop('disabled', false);
+            $('#resetButton').prop('disabled', false);
+        }
+    }
+    
+    // Pause the timer
+    function pauseTimer() {
+        if (isRunning) {
+            isRunning = false;
+            clearInterval(timer);
+            $('#startButton').prop('disabled', false);
+            $('#pauseButton').prop('disabled', true);
+        }
+    }
+    
+    // Reset the timer
+    function resetTimer() {
+        pauseTimer();
+        timeLeft = isBreak ? 
+            (currentCycle % cyclesBeforeLongBreak === 0 ? longBreak : shortBreak) : 
+            workDuration;
+        updateDisplay();
+    }
+    
+    // Button event handlers
+    $('#startButton').click(startTimer);
+    $('#pauseButton').click(pauseTimer);
+    $('#resetButton').click(resetTimer);
+    
+    // Skip to next phase button
+    $('#skipButton').click(function() {
+        if (confirm('Skip to the next phase?')) {
+            completePhase();
+        }
+    });
+    
+    // Initialize display
+    updateDisplay();
+});
