@@ -1,0 +1,12 @@
+def complete_pomodoro_cycle(task_id):
+    conn = sqlite3.connect('tasks.db')
+    cursor = conn.cursor()
+    
+    # Increment the pomodoro count
+    cursor.execute(
+        'UPDATE tasks SET pomodoro_cycles = pomodoro_cycles + 1, total_pomodoro_time = total_pomodoro_time + ? WHERE id = ?', 
+        (25, task_id)  # 25 minutes per cycle
+    )
+    
+    conn.commit()
+    conn.close()
