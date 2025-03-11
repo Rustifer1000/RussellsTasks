@@ -1,0 +1,286 @@
+import datetime
+import webbrowser
+import json
+import os
+from typing import Dict, List, Optional
+
+import requests
+import msal  # Microsoft Authentication Library
+from dataclasses import dataclass
+
+@dataclass
+class Task:
+    id: Optional[int] = None
+    title: str = ""
+    description: str = ""
+    due_date: Optional[datetime.datetime] = None
+    priority: int = 3  # 1-5 scale
+    completed: bool = False
+    tags: List[str] = None
+
+class OutlookCalendarIntegrator:
+    """
+    Outlook Calendar integration using Microsoft Graph API.
+    """
+    def __init__(self, config_file='outlook_config.json'):
+        self.config_file = config_file
+        self.config = self._load_config()
+        self.token_cache = msal.SerializableTokenCache()
+        
+        # Load token cache from file if it exists
+        if os.path.exists('token_cache.json'):
+            self.token_cache.deserialize(open('token_cache.json', 'r').read())
+            
+        # Create MSAL app
+        self.app = msal.PublicClientApplication(
+            client_id=self.config['client_id'],
+            authority=f"https://login.microsoftonline.com/{self.config['tenant_id']}",
+            token_cache=self.token_cache
+        )
+        
+    def _load_config(self) -> Dict:
+        """Load configuration from JSON file."""
+        if not os.path.exists(self.config_file):
+            # Create template config file if it doesn't exist
+            config = {
+                "client_id": "",
+                "tenant_id": "common",  # Use "common" for personal accounts or specify tenant ID
+                "scopes": ["Calendars.ReadWrite"]
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=4)
+            print(f"Created template config file: {self.config_file}")
+            print("Please edit this file with your Microsoft application details.")
+        
+        with open(self.config_file, 'r') as f:
+            return json.load(f)
+    
+    def _save_token_cache(self):
+        """Save token cache to file."""
+        if self.token_cache.has_state_changed:
+            with open('token_cache.json', 'w') as f:
+                f.write(self.token_cache.serialize())
+    
+    def _get_token(self):
+        """Get auth token, acquiring it through user login if necessary."""
+        accounts = self.app.get_accounts()
+        if accounts:
+            # If we have accounts in the cache, try to get token silently
+            result = self.app.acquire_token_silent(self.config['scopes'], account=accounts[0])
+        else:
+            # No suitable token in cache, we need interactive login
+            result = self.app.acquire_token_interactive(self.config['scopes'])
+            
+        self._save_token_cache()
+        return result
+    
+    def add_task_to_calendar(self, task: Task, duration_minutes: int = 60) -> bool:
+        """Add a task to Outlook calendar as an event."""
+        if not task.due_date:
+            print(f"Task '{task.title}' has no due date, skipping calendar sync")
+            return False
+        
+        token_response = self._get_token()
+        if 'access_token' not in token_response:
+            print(f"Authentication failed: {token_response.get('error_description', 'No error description')}")
+            return False
+        
+        # Calculate event end time
+        start_time = task.due_date
+        end_time = start_time + datetime.timedelta(minutes=duration_minutes)
+        
+        # Format times in ISO 8601 format
+        start_iso = start_time.isoformat()
+        end_iso = end_time.isoformat()
+        
+        # Create event payload
+        event = {
+            "subject": f"[Priority {task.priority}] {task.title}",
+            "body": {
+                "contentType": "text",
+                "content": task.description or "Task from planning assistant"
+            },
+            "start": {
+                "dateTime": start_iso,
+                "timeZone": "UTC"
+            },
+            "end": {
+                "dateTime": end_iso,
+                "timeZone": "UTC"
+            },
+            "reminderMinutesBeforeStart": 15,
+            "isReminderOn": True
+        }
+        
+        # Add categories/tags if available
+        if task.tags and len(task.tags) > 0:
+            event["categories"] = task.tags
+        
+        # Send request to Graph API
+        headers = {
+            'Authorization': f"Bearer {token_response['access_token']}",
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(
+            'https://graph.microsoft.com/v1.0/me/events',
+            headers=headers,
+            json=event
+        )
+        
+        if response.status_code in (201, 200):
+            print(f"Successfully added task '{task.title}' to calendar")
+            return True
+        else:
+            print(f"Failed to add task to calendar: {response.status_code} - {response.text}")
+            return False
+    
+    def get_calendar_events(self, days: int = 7) -> List[Dict]:
+        """Get upcoming calendar events for the specified number of days."""
+        token_response = self._get_token()
+        if 'access_token' not in token_response:
+            print(f"Authentication failed: {token_response.get('error_description', 'No error description')}")
+            return []
+        
+        # Calculate date range
+        start_date = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        end_date = (datetime.datetime.now() + datetime.timedelta(days=days)).replace(
+            hour=23, minute=59, second=59).isoformat()
+        
+        # Query parameters
+        params = {
+            'startDateTime': start_date,
+            'endDateTime': end_date,
+            '$select': 'subject,bodyPreview,start,end,categories',
+            '$orderby': 'start/dateTime',
+            '$top': 50
+        }
+        
+        # Send request to Graph API
+        headers = {
+            'Authorization': f"Bearer {token_response['access_token']}",
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.get(
+            'https://graph.microsoft.com/v1.0/me/calendarView',
+            headers=headers,
+            params=params
+        )
+        
+        if response.status_code == 200:
+            events = response.json().get('value', [])
+            print(f"Retrieved {len(events)} calendar events")
+            return events
+        else:
+            print(f"Failed to retrieve calendar events: {response.status_code} - {response.text}")
+            return []
+
+    def setup_application(self):
+        """
+        Guide user through setting up a Microsoft Graph application.
+        This is a helper method for first-time setup.
+        """
+        print("\n=== Microsoft Graph API Setup Guide ===\n")
+        print("To integrate with Outlook Calendar, you need to register an application in Azure Active Directory.")
+        print("Follow these steps:")
+        print("1. Go to https://portal.azure.com")
+        print("2. Navigate to 'Azure Active Directory' > 'App registrations' > 'New registration'")
+        print("3. Name your application (e.g., 'Task Planner')")
+        print("4. Set Redirect URI to 'http://localhost'")
+        print("5. Click 'Register'")
+        print("6. On the Overview page, copy the 'Application (client) ID' and 'Directory (tenant) ID'")
+        
+        open_portal = input("\nWould you like me to open the Azure portal for you? (y/n): ")
+        if open_portal.lower() == 'y':
+            webbrowser.open("https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade")
+        
+        print("\nAfter registration, please enter the following details:")
+        client_id = input("Application (client) ID: ")
+        tenant_id = input("Directory (tenant) ID (or press Enter to use 'common' for personal accounts): ")
+        
+        if not tenant_id:
+            tenant_id = "common"
+        
+        # Update configuration file
+        config = {
+            "client_id": client_id,
+            "tenant_id": tenant_id,
+            "scopes": ["Calendars.ReadWrite"]
+        }
+        
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f, indent=4)
+        
+        print(f"\nConfiguration saved to {self.config_file}")
+        print("Now let's verify the connection...")
+        
+        # Reload config and try to get token
+        self.config = self._load_config()
+        self.app = msal.PublicClientApplication(
+            client_id=self.config['client_id'],
+            authority=f"https://login.microsoftonline.com/{self.config['tenant_id']}",
+            token_cache=self.token_cache
+        )
+        
+        try:
+            result = self.app.acquire_token_interactive(self.config['scopes'])
+            if 'access_token' in result:
+                print("\n✓ Authentication successful! Your application is now set up correctly.")
+                self._save_token_cache()
+                return True
+            else:
+                print(f"\n✗ Authentication failed: {result.get('error_description', 'Unknown error')}")
+                return False
+        except Exception as e:
+            print(f"\n✗ An error occurred during authentication: {str(e)}")
+            return False
+
+def test_calendar_integration():
+    """Simple test function to verify the calendar integration."""
+    integrator = OutlookCalendarIntegrator()
+    
+    # Check if config is properly set up
+    if not integrator.config.get('client_id'):
+        print("Microsoft Graph API is not configured.")
+        setup = input("Would you like to set it up now? (y/n): ")
+        if setup.lower() == 'y':
+            if not integrator.setup_application():
+                print("Setup was not completed successfully. Please try again later.")
+                return
+        else:
+            print("Calendar integration test cancelled.")
+            return
+    
+    # Create a test task
+    test_task = Task(
+        title="Test Calendar Integration",
+        description="This is a test task to verify Outlook Calendar integration",
+        due_date=datetime.datetime.now() + datetime.timedelta(hours=1),
+        priority=3,
+        tags=["test", "integration"]
+    )
+    
+    # Add task to calendar
+    success = integrator.add_task_to_calendar(test_task)
+    
+    if success:
+        print("\nCalendar test successful! Check your Outlook calendar for the test event.")
+        
+        # Retrieve events to verify
+        print("\nRetrieving upcoming calendar events...")
+        events = integrator.get_calendar_events(days=1)
+        if events:
+            print("\nUpcoming events:")
+            for event in events:
+                subject = event.get('subject', 'No subject')
+                start_time = event.get('start', {}).get('dateTime', 'No time')
+                if 'Z' in start_time:
+                    # Convert UTC time to local time
+                    start_time = datetime.datetime.fromisoformat(start_time.replace('Z', '+00:00')).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"- {subject} at {start_time}")
+    else:
+        print("\nCalendar test failed. Please check the error messages above.")
+
+if __name__ == "__main__":
+    test_calendar_integration()
