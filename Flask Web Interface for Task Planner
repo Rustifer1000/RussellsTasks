@@ -1,0 +1,405 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+import datetime
+import sqlite3
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+
+# Task data model (simplified from your core implementation)
+@dataclass
+class Task:
+    id: Optional[int] = None
+    title: str = ""
+    description: str = ""
+    due_date: Optional[datetime.datetime] = None
+    priority: int = 3  # 1-5 scale
+    completed: bool = False
+    tags: List[str] = None
+    
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
+            
+    @classmethod
+    def from_db_row(cls, row):
+        """Create a Task instance from a database row"""
+        task = cls(
+            id=row['id'],
+            title=row['title'],
+            description=row['description'],
+            priority=row['priority'],
+            completed=bool(row['completed'])
+        )
+        
+        if row['due_date']:
+            task.due_date = datetime.datetime.fromisoformat(row['due_date'])
+        
+        # Tags would be loaded separately
+        return task
+            
+    def to_dict(self):
+        """Convert to dictionary for JSON response"""
+        result = asdict(self)
+        # Convert datetime to string for JSON serialization
+        if self.due_date:
+            result['due_date'] = self.due_date.isoformat()
+        return result
+
+
+# Database Manager class (simplified from your core implementation)
+class DatabaseManager:
+    def __init__(self, db_path='tasks.db'):
+        self.db_path = db_path
+        self._create_tables()
+    
+    def _create_tables(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create tasks table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            due_date TEXT,
+            priority INTEGER DEFAULT 3,
+            completed BOOLEAN DEFAULT 0
+        )
+        ''')
+        
+        # Create tags table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        )
+        ''')
+        
+        # Create task_tags relation table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS task_tags (
+            task_id INTEGER,
+            tag_id INTEGER,
+            PRIMARY KEY (task_id, tag_id),
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def add_task(self, task: Task) -> int:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Insert task
+        cursor.execute(
+            'INSERT INTO tasks (title, description, due_date, priority, completed) VALUES (?, ?, ?, ?, ?)',
+            (task.title, task.description, task.due_date.isoformat() if task.due_date else None, 
+             task.priority, task.completed)
+        )
+        
+        task_id = cursor.lastrowid
+        
+        # Handle tags
+        for tag_name in task.tags:
+            # Skip empty tags
+            if not tag_name.strip():
+                continue
+                
+            # Insert tag if it doesn't exist
+            cursor.execute('INSERT OR IGNORE INTO tags (name) VALUES (?)', (tag_name,))
+            cursor.execute('SELECT id FROM tags WHERE name = ?', (tag_name,))
+            tag_id = cursor.fetchone()[0]
+            
+            # Link tag to task
+            cursor.execute('INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)', 
+                         (task_id, tag_id))
+        
+        conn.commit()
+        conn.close()
+        
+        return task_id
+    
+    def get_tasks(self, completed=None, priority=None, tag=None) -> List[Task]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = 'SELECT t.* FROM tasks t'
+        params = []
+        
+        if tag:
+            query += ' JOIN task_tags tt ON t.id = tt.task_id JOIN tags tg ON tt.tag_id = tg.id'
+        
+        conditions = []
+        if completed is not None:
+            conditions.append('t.completed = ?')
+            params.append(completed)
+        
+        if priority:
+            conditions.append('t.priority = ?')
+            params.append(priority)
+            
+        if tag:
+            conditions.append('tg.name = ?')
+            params.append(tag)
+        
+        if conditions:
+            query += ' WHERE ' + ' AND '.join(conditions)
+        
+        cursor.execute(query, params)
+        
+        tasks = []
+        for row in cursor.fetchall():
+            task = Task.from_db_row(row)
+            
+            # Get tags
+            tag_cursor = conn.cursor()
+            tag_cursor.execute('''
+                SELECT t.name FROM tags t
+                JOIN task_tags tt ON t.id = tt.tag_id
+                WHERE tt.task_id = ?
+            ''', (task.id,))
+            
+            task.tags = [tag[0] for tag in tag_cursor.fetchall()]
+            tasks.append(task)
+        
+        conn.close()
+        return tasks
+
+    def get_task_by_id(self, task_id: int) -> Optional[Task]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            conn.close()
+            return None
+            
+        task = Task.from_db_row(row)
+        
+        # Get tags
+        cursor.execute('''
+            SELECT t.name FROM tags t
+            JOIN task_tags tt ON t.id = tt.tag_id
+            WHERE tt.task_id = ?
+        ''', (task.id,))
+        
+        task.tags = [tag[0] for tag in cursor.fetchall()]
+        
+        conn.close()
+        return task
+
+    def update_task(self, task: Task) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            'UPDATE tasks SET title = ?, description = ?, due_date = ?, priority = ?, completed = ? WHERE id = ?',
+            (task.title, task.description, task.due_date.isoformat() if task.due_date else None, 
+             task.priority, task.completed, task.id)
+        )
+        
+        # Handle tags - remove existing tags
+        cursor.execute('DELETE FROM task_tags WHERE task_id = ?', (task.id,))
+        
+        # Add new tags
+        for tag_name in task.tags:
+            # Skip empty tags
+            if not tag_name.strip():
+                continue
+                
+            cursor.execute('INSERT OR IGNORE INTO tags (name) VALUES (?)', (tag_name,))
+            cursor.execute('SELECT id FROM tags WHERE name = ?', (tag_name,))
+            tag_id = cursor.fetchone()[0]
+            cursor.execute('INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)', 
+                         (task.id, tag_id))
+        
+        conn.commit()
+        conn.close()
+        
+        return cursor.rowcount > 0
+
+    def delete_task(self, task_id: int) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+        
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        
+        return success
+
+    def toggle_task_completion(self, task_id: int) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Get current completion status
+        cursor.execute('SELECT completed FROM tasks WHERE id = ?', (task_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            conn.close()
+            return False
+            
+        # Toggle the completion status
+        new_status = 1 if row[0] == 0 else 0
+        cursor.execute('UPDATE tasks SET completed = ? WHERE id = ?', (new_status, task_id))
+        
+        conn.commit()
+        conn.close()
+        
+        return True
+
+
+# Create Flask app
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here'  # Used for flash messages
+db = DatabaseManager()
+
+# Flask routes
+@app.route('/')
+def index():
+    """Main page with task list"""
+    # Get filter parameters from request
+    show_completed = request.args.get('show_completed', 'false') == 'true'
+    filter_priority = request.args.get('priority')
+    filter_tag = request.args.get('tag')
+    
+    # Get tasks based on filters
+    if show_completed:
+        tasks = db.get_tasks(priority=filter_priority, tag=filter_tag)
+    else:
+        tasks = db.get_tasks(completed=False, priority=filter_priority, tag=filter_tag)
+    
+    # Get all available tags for filter dropdown
+    all_tasks = db.get_tasks()
+    all_tags = set()
+    for task in all_tasks:
+        all_tags.update(task.tags)
+    
+    return render_template(
+        'index.html', 
+        tasks=tasks, 
+        all_tags=sorted(all_tags),
+        show_completed=show_completed,
+        filter_priority=filter_priority,
+        filter_tag=filter_tag
+    )
+
+@app.route('/task/new', methods=['GET', 'POST'])
+def new_task():
+    """Create a new task"""
+    if request.method == 'POST':
+        # Get form data
+        title = request.form.get('title')
+        description = request.form.get('description', '')
+        due_date_str = request.form.get('due_date', '')
+        due_time_str = request.form.get('due_time', '')
+        priority = int(request.form.get('priority', 3))
+        tags = request.form.get('tags', '').split(',')
+        
+        # Create task object
+        task = Task(
+            title=title,
+            description=description,
+            priority=priority,
+            tags=[tag.strip() for tag in tags if tag.strip()]
+        )
+        
+        # Parse due date and time if provided
+        if due_date_str:
+            if due_time_str:
+                due_datetime = datetime.datetime.strptime(f"{due_date_str} {due_time_str}", "%Y-%m-%d %H:%M")
+            else:
+                due_datetime = datetime.datetime.strptime(due_date_str, "%Y-%m-%d")
+            task.due_date = due_datetime
+        
+        # Add task to database
+        db.add_task(task)
+        flash('Task created successfully!', 'success')
+        return redirect(url_for('index'))
+    
+    return render_template('task_form.html', task=None)
+
+@app.route('/task/<int:task_id>/edit', methods=['GET', 'POST'])
+def edit_task(task_id):
+    """Edit an existing task"""
+    task = db.get_task_by_id(task_id)
+    
+    if not task:
+        flash('Task not found!', 'error')
+        return redirect(url_for('index'))
+    
+    if request.method == 'POST':
+        # Update task with form data
+        task.title = request.form.get('title')
+        task.description = request.form.get('description', '')
+        due_date_str = request.form.get('due_date', '')
+        due_time_str = request.form.get('due_time', '')
+        task.priority = int(request.form.get('priority', 3))
+        task.tags = [tag.strip() for tag in request.form.get('tags', '').split(',') if tag.strip()]
+        
+        # Parse due date and time if provided
+        if due_date_str:
+            if due_time_str:
+                due_datetime = datetime.datetime.strptime(f"{due_date_str} {due_time_str}", "%Y-%m-%d %H:%M")
+            else:
+                due_datetime = datetime.datetime.strptime(due_date_str, "%Y-%m-%d")
+            task.due_date = due_datetime
+        else:
+            task.due_date = None
+        
+        # Update task in database
+        db.update_task(task)
+        flash('Task updated successfully!', 'success')
+        return redirect(url_for('index'))
+    
+    return render_template('task_form.html', task=task)
+
+@app.route('/task/<int:task_id>/delete', methods=['POST'])
+def delete_task(task_id):
+    """Delete a task"""
+    if db.delete_task(task_id):
+        flash('Task deleted successfully!', 'success')
+    else:
+        flash('Failed to delete task!', 'error')
+    
+    return redirect(url_for('index'))
+
+@app.route('/task/<int:task_id>/toggle', methods=['POST'])
+def toggle_task(task_id):
+    """Toggle task completion status"""
+    if db.toggle_task_completion(task_id):
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'error': 'Task not found'}), 404
+
+@app.route('/pomodoro/<int:task_id>')
+def pomodoro(task_id):
+    """Pomodoro timer page for a specific task"""
+    task = db.get_task_by_id(task_id)
+    
+    if not task:
+        flash('Task not found!', 'error')
+        return redirect(url_for('index'))
+    
+    return render_template('pomodoro.html', task=task)
+
+# API routes for potential future use
+@app.route('/api/tasks', methods=['GET'])
+def api_get_tasks():
+    """API endpoint to get tasks as JSON"""
+    tasks = db.get_tasks()
+    return jsonify([task.to_dict() for task in tasks])
+
+# Run the application
+if __name__ == '__main__':
+    app.run(debug=True)
